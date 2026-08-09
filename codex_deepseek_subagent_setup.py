@@ -160,7 +160,7 @@ What it manages (relative to the Codex home, CODEX_HOME or ~/.codex):
   4. hooks.json                        SubagentStart Hook (matcher
                                        ^v4_flash_worker$, timeout 60,
                                        additionalContextLimit 0, Windows
-                                       commandWindows with -X utf8), merged
+                                       commandWindows field with -X utf8), merged
                                        without touching unrelated hooks or
                                        writing any trust hash
   5. config.toml                       [shell_environment_policy.set] with
@@ -1932,7 +1932,7 @@ def main():
     )
     parser.add_argument(
         "--python-executable", default=None,
-        help="Python executable for the Windows Hook commandWindows "
+        help="Python executable for the Windows Hook commandWindows field "
         "(default: the interpreter running this script)",
     )
     parser.add_argument(

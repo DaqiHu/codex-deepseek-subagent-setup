@@ -3,11 +3,27 @@
 import json
 import os
 import stat
+import subprocess
+import sys
 
 import codex_deepseek_subagent_setup as mod
 from conftest import make_args, setup_install
 
 WINDOWS_PYTHON = r"C:\Python 3.14\python.exe"
+
+
+def test_help_describes_command_windows_field_without_word_joining():
+    result = subprocess.run(
+        [sys.executable, mod.__file__, "--help"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    normalized_help = " ".join(result.stdout.split())
+    assert "commandWindows field" in normalized_help
+    assert "commandWindowsfield" not in normalized_help
+    assert "commandWindows field" in mod.MANUAL
+    assert "commandWindows with" not in mod.MANUAL
 
 
 def test_windows_hook_command_and_no_chmod(tmp_path, monkeypatch, capsys):
