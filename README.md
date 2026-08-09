@@ -36,8 +36,12 @@ Requires Python 3.11+ (and optionally [uv](https://docs.astral.sh/uv/)).
 # one-shot, no clone (uv):
 uv run --refresh https://raw.githubusercontent.com/DaqiHu/codex-deepseek-subagent-setup/main/codex_deepseek_subagent_setup.py
 
-# or install as a tool (uv):
+# or run once from git, nothing installed (uv):
+uvx --from git+https://github.com/DaqiHu/codex-deepseek-subagent-setup codex-deepseek-subagent-setup --dry-run
+
+# or install as a persistent tool (uv):
 uv tool install git+https://github.com/DaqiHu/codex-deepseek-subagent-setup
+codex-deepseek-subagent-setup --manual
 
 # or clone and run:
 git clone https://github.com/DaqiHu/codex-deepseek-subagent-setup
