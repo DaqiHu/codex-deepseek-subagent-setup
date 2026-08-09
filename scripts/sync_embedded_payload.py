@@ -11,9 +11,14 @@ Usage:
     python scripts/sync_embedded_payload.py                 # embed payload/
     python scripts/sync_embedded_payload.py --source <dir>  # copy canonical files
                                                              # from <dir> first, then embed
+    python scripts/sync_embedded_payload.py --check         # read-only parity check;
+                                                             # exits nonzero on drift
 
 A parity test (tests/test_payload.py) fails when payload/ and the embedded
-copy drift, so the repo stays the single source of truth.
+copy drift, so the repo stays the single source of truth. ``--check`` performs
+the same comparison without writing anything: it regenerates the embedded block
+from payload/ + pyproject.toml and exits 1 when the installer file would
+change (payload drift, manual edits to the embedded block, or version drift).
 """
 
 from __future__ import annotations
@@ -84,6 +89,35 @@ def read_payload() -> dict[str, bytes]:
     return blobs
 
 
+def check_drift() -> list[str]:
+    """Return drift problems; empty means payload/, embed, and version match.
+
+    Read-only: compares the embedded block against what the sync would write
+    without touching any file.
+    """
+    problems: list[str] = []
+    try:
+        source = INSTALLER.read_text(encoding="utf-8")
+    except OSError as error:
+        return [f"cannot read {INSTALLER}: {error}"]
+    try:
+        blobs = read_payload()
+    except OSError as error:
+        return [f"cannot read payload tree under {PAYLOAD_DIR}: {error}"]
+    manifest = {rel: sha256_bytes(data) for rel, data in blobs.items()}
+    try:
+        block = render_block(read_version(), manifest, blobs)
+        updated = replace_embedded_block(source, block)
+    except SystemExit as error:
+        return [str(error)]
+    if updated != source:
+        problems.append(
+            "payload/ or pyproject version drifted from the embedded copy; "
+            "re-run scripts/sync_embedded_payload.py"
+        )
+    return problems
+
+
 def replace_embedded_block(source: str, block: str) -> str:
     start = source.find(BEGIN_MARKER)
     end = source.find(END_MARKER)
@@ -105,7 +139,20 @@ def main() -> int:
         "--source",
         help="optional canonical skill directory to copy payload files from first",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify payload/embed/version parity read-only; exit nonzero on drift",
+    )
     args = parser.parse_args()
+
+    if args.check:
+        problems = check_drift()
+        for problem in problems:
+            print(f"CHECK FAIL: {problem}")
+        if not problems:
+            print("check: payload/, embedded copy, and pyproject version are in sync")
+        return 1 if problems else 0
 
     if args.source:
         source_root = pathlib.Path(args.source).expanduser().resolve()

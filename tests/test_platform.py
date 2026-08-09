@@ -55,7 +55,7 @@ def test_codex_home_with_backslashes(tmp_path, monkeypatch, capsys):
     home = tmp_path / "codex-home"
     home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(home))
-    monkeypatch.setattr(mod, "resolve_credentials", lambda codex_home: ("u", "p", "t"))
+    monkeypatch.setattr(mod, "resolve_credentials", lambda codex_home: ("u", 'experimental_bearer_token = "t"', "t"))
     monkeypatch.setattr(mod, "is_windows", lambda: False)
     backup_root = tmp_path / "backups"
     assert mod.cmd_install(make_args(backup_dir=str(backup_root))) == 0

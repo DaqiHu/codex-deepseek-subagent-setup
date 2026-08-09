@@ -57,8 +57,10 @@ The installer prompts for base URL and API key on a TTY (press Enter to
 auto-resolve). Resolution order:
 
 1. explicit interactive input
-2. an existing bearer token already installed in the agent file is preserved
-   (a noninteractive `--update` never silently replaces it)
+2. an existing credential already installed in the agent file is preserved
+   exactly - a bearer token (`experimental_bearer_token`) or an `env_key`
+   entry keeps both its value and its base URL (a noninteractive `--update`
+   never silently replaces the credential mechanism)
 3. `~/.kimi-code/config.toml` → `[providers.opencode-go]` (base URL + token)
 4. fallback: official `https://api.deepseek.com` + `DEEPSEEK_API_KEY` env var
 
@@ -72,7 +74,7 @@ idempotent install/upsert for backward compatibility.
 | Command | Behavior |
 |---|---|
 | `(default)` | install/upsert: create missing artifacts and refresh owned content idempotently |
-| `--add` | create only missing artifacts; never overwrite existing content (use `--update` to refresh) |
+| `--add` | create only missing artifacts; atomic and strict: if any managed artifact already exists and would change, exit `2` and write/own nothing (use `--update` to refresh) |
 | `--update` | refresh owned content to the payload; preserves an existing credential token |
 | `--backup` | create a backup snapshot now |
 | `--list-backups` | list backup IDs |
@@ -104,8 +106,8 @@ python3 codex_deepseek_subagent_setup.py --remove --yes       # real removal
 | Code | Meaning |
 |---|---|
 | `0` | success or no-op |
-| `1` | failure (write failure with automatic rollback, no backups found) |
-| `2` | usage error or refusal (conflicting actions, unknown backup ID, destructive action without `--yes`/`--force`) |
+| `1` | failure (write/state-save/validation failure with automatic rollback, no backups found) |
+| `2` | usage error or refusal (conflicting actions, `--add` conflict, unknown backup ID, destructive action without `--yes`/`--force`) |
 
 ## Backups and state
 
@@ -114,20 +116,35 @@ python3 codex_deepseek_subagent_setup.py --remove --yes       # real removal
   switchers such as cc-switch, which swap `~/.codex`, never destroy them.
 - Backups are **absence-aware**: the manifest lists every managed file,
   including files that were absent, so restore can delete installed extras.
-- On a failed mutation the pre-change snapshot is restored automatically
-  (rollback).
+- Writes, state save, and post-write validation run inside one rollback-protected
+  transaction: a write failure, a state-save failure, or a validation failure
+  restores the pre-change snapshot and exits `1`.
+- Credential and base-URL values are TOML-escaped when the agent file is
+  generated, so user/existing/kimi input can never produce malformed TOML.
 - `--restore` is an exact snapshot restore; ownership is restored from the
   snapshot too, so a pre-install snapshot leaves the home unowned again.
+- A pre-restore safety snapshot is created before the restore (unless
+  `--skip-backup`) and its ID is reported as `safety_backup_id` in the JSON
+  result, separate from the `backup_id` being restored from.
+- For an absent-snapshot entry (a file the installer created that was not in
+  the snapshot), `--yes` authorizes deleting it even when it has drifted from
+  the recorded state.
 - `--remove` deletes only owned whole files/directories whose hashes match the
   recorded state (unless `--force`) and surgically removes only the owned
   `hooks.json` group, `[shell_environment_policy.set]` keys, and AGENTS marker
-  block, preserving unrelated user bytes/content.
+  block, preserving unrelated user bytes/content. A `hooks.json` is deleted
+  wholesale only when it is provably an installer-created shell (recorded hash
+  match AND no unrelated top-level content, description, or hook group); a
+  pre-existing merged `hooks.json` keeps its unrelated content.
 
 ## Hook trust
 
 Codex trusts the exact Hook definition hash and intentionally skips changed
-command hooks until they are reviewed. When an install reports
-`hook_review_required` (the Hook definition changed):
+command hooks until they are reviewed. `--status` compares the live Hook to
+the definition hash recorded at install time, so running status with a
+different Python interpreter than the one used for the install does not create
+a false trust alert. When an install reports `hook_review_required` (the Hook
+definition changed):
 
 1. Open **Settings -> Hooks** in the Codex app.
 2. Review the changed `^v4_flash_worker$` definition and trust it.
@@ -148,10 +165,14 @@ python scripts/sync_embedded_payload.py --source ~/.agents/codex/skills/use-v4-f
 
 # re-embed after editing payload/:
 python scripts/sync_embedded_payload.py
+
+# read-only parity check (exits nonzero on drift; writes nothing):
+python scripts/sync_embedded_payload.py --check
 ```
 
 A parity test (`tests/test_payload.py`) fails when `payload/`, the embedded
-copy, and the pyproject version drift.
+copy, and the pyproject version drift; `sync_embedded_payload.py --check`
+performs the same comparison from the CLI without writing anything.
 
 ## Development
 

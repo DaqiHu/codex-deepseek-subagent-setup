@@ -69,8 +69,12 @@ def test_add_never_overwrites_existing(tmp_path, monkeypatch, capsys):
     agent = home / "agents/v4-flash-worker.toml"
     agent.parent.mkdir(parents=True, exist_ok=True)
     agent.write_text('name = "v4_flash_worker"\nmodel = "custom"\n', encoding="utf-8")
-    assert mod.cmd_add(make_args(backup_dir=str(backup_root))) == 0
+    # --add is atomic and strict: a conflicting existing artifact is a refusal
+    # (exit 2) and nothing else is written or owned.
+    assert mod.cmd_add(make_args(backup_dir=str(backup_root))) == 2
     assert agent.read_text() == 'name = "v4_flash_worker"\nmodel = "custom"\n'
+    assert not (home / "skills").exists()
+    assert not mod.state_dir(home).exists()
     out = capsys.readouterr().out
     assert "use --update" in out
 

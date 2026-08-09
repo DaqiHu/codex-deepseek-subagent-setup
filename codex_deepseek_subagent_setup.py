@@ -134,7 +134,7 @@ sandbox_mode = "danger-full-access"
 
 [model_providers.deepseek]
 name = "DeepSeek"
-base_url = "{base_url}"
+base_url = {base_url}
 wire_api = "responses"
 {provider_lines}
 '''
@@ -148,8 +148,8 @@ What it manages (relative to the Codex home, CODEX_HOME or ~/.codex):
                                        provider deepseek, sandbox
                                        danger-full-access, base URL +
                                        credential (interactive input, an
-                                       existing preserved token,
-                                       ~/.kimi-code opencode-go, or
+                                       existing preserved bearer token or
+                                       env_key, ~/.kimi-code opencode-go, or
                                        DEEPSEEK_API_KEY env key)
   2. skills/use-v4-flash-worker/       the authoritative Codex-only skill
                                        (SKILL.md, agents/openai.yaml,
@@ -174,8 +174,9 @@ What it manages (relative to the Codex home, CODEX_HOME or ~/.codex):
 Actions (mutually exclusive):
   (default)          install/upsert: create missing artifacts and refresh owned
                      content idempotently (backward compatible)
-  --add              create only missing artifacts; never overwrite existing
-                     content (use --update to refresh)
+  --add              create only missing artifacts; atomic and strict: any
+                     existing artifact that would change is a conflict (exit 2)
+                     and nothing is written or owned
   --update           refresh owned content to the payload; preserves an
                      existing credential token on a noninteractive run
   --backup           create a backup snapshot now
@@ -199,8 +200,8 @@ Shared flags:
 Exit codes:
   0  success or no-op
   1  failure (write failure with rollback, download/validation error)
-  2  usage error or refusal (conflicting actions, unknown backup ID,
-     destructive action without --yes/--force)
+  2  usage error or refusal (conflicting actions, --add conflict,
+     unknown backup ID, destructive action without --yes/--force)
 
 Backups:
   - Created BEFORE any mutation and stored outside the Codex home
@@ -334,8 +335,23 @@ def load_opencode_go_credentials():
     return None, None
 
 
+def toml_string(value):
+    """Return a TOML basic-string literal (with surrounding quotes) for value.
+
+    Uses JSON string escaping, which is a valid subset of TOML basic strings:
+    ``"``, ``\\``, control characters, and other specials are escaped, so a
+    credential or base URL can never produce malformed TOML.
+    """
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def _existing_agent_credentials(codex_home):
-    """Return (base_url, provider_lines) preserved from the installed agent file."""
+    """Return (base_url, provider_lines) preserved from the installed agent file.
+
+    Preserves either an ``experimental_bearer_token`` or an ``env_key``
+    credential so a noninteractive update never silently changes the
+    credential mechanism. Both are re-emitted with TOML escaping.
+    """
     path = codex_home / AGENT_FILENAME
     if not path.exists():
         return None
@@ -344,11 +360,16 @@ def _existing_agent_credentials(codex_home):
     except (tomllib.TOMLDecodeError, UnicodeDecodeError):
         return None
     provider = data.get("model_providers", {}).get("deepseek", {})
-    token = provider.get("experimental_bearer_token")
-    if not token:
+    if not isinstance(provider, dict):
         return None
     base_url = provider.get("base_url")
-    return base_url, f'experimental_bearer_token = "{token}"'
+    token = provider.get("experimental_bearer_token")
+    if token:
+        return base_url, f"experimental_bearer_token = {toml_string(token)}"
+    env_key = provider.get("env_key")
+    if env_key:
+        return base_url, f"env_key = {toml_string(env_key)}"
+    return None
 
 
 def resolve_credentials(codex_home):
@@ -376,20 +397,27 @@ def resolve_credentials(codex_home):
             user_key = None
     if user_key:
         base = user_base or "https://api.deepseek.com"
-        return base, f'experimental_bearer_token = "{user_key}"', "user input"
+        return base, f"experimental_bearer_token = {toml_string(user_key)}", "user input"
     if existing:
         base = user_base or existing[0] or "https://api.deepseek.com"
-        return base, existing[1], "existing agent token (preserved)"
+        label = (
+            "existing env_key (preserved)"
+            if "env_key" in existing[1]
+            else "existing agent token (preserved)"
+        )
+        return base, existing[1], label
     if user_base:
-        return user_base, 'env_key = "DEEPSEEK_API_KEY"', "env var DEEPSEEK_API_KEY (official endpoint)"
+        return user_base, f"env_key = {toml_string('DEEPSEEK_API_KEY')}", "env var DEEPSEEK_API_KEY (official endpoint)"
     kimi_base, kimi_key = load_opencode_go_credentials()
     if kimi_base and kimi_key:
-        return kimi_base, f'experimental_bearer_token = "{kimi_key}"', "~/.kimi-code [providers.opencode-go]"
-    return "https://api.deepseek.com", 'env_key = "DEEPSEEK_API_KEY"', "env var DEEPSEEK_API_KEY (official endpoint)"
+        return kimi_base, f"experimental_bearer_token = {toml_string(kimi_key)}", "~/.kimi-code [providers.opencode-go]"
+    return "https://api.deepseek.com", f"env_key = {toml_string('DEEPSEEK_API_KEY')}", "env var DEEPSEEK_API_KEY (official endpoint)"
 
 
 def agent_toml_content(base_url, provider_lines):
-    return AGENT_TOML_TEMPLATE.format(base_url=base_url, provider_lines=provider_lines)
+    return AGENT_TOML_TEMPLATE.format(
+        base_url=toml_string(base_url), provider_lines=provider_lines
+    )
 
 
 def hook_replacement_group(codex_home, python_executable):
@@ -641,7 +669,7 @@ def _plan_restore(backup_dir, codex_home, yes, force):
         if entry.get("absent"):
             if not target.exists():
                 continue
-            if sha256_of(target) == state.get("files", {}).get(rel) or force:
+            if sha256_of(target) == state.get("files", {}).get(rel) or force or yes:
                 plan.append((rel, "delete"))
             else:
                 refused.append(rel)
@@ -714,8 +742,42 @@ def restore_backup(backup_dir, codex_home, yes=False, force=False, dry_run=False
     return {"restored": restored, "deleted": deleted, "skipped": [], "refused": []}
 
 
+def _hooks_document_has_unrelated_content(document):
+    """True when a hooks.json contains anything the installer does not own.
+
+    The installer only owns the ``description`` value it writes and the
+    ``SubagentStart`` group whose matcher is HOOK_GROUP_MATCHER. Any other
+    top-level key, a different description, another hook category, or a
+    remaining SubagentStart group counts as unrelated content.
+    """
+    if not isinstance(document, dict):
+        return True
+    for key in document:
+        if key not in ("description", "hooks"):
+            return True
+    if "description" in document and document["description"] != HOOK_DESCRIPTION:
+        return True
+    hooks = document.get("hooks")
+    if hooks is not None:
+        if not isinstance(hooks, dict):
+            return True
+        for category in hooks:
+            if category != "SubagentStart":
+                return True
+        if hooks.get("SubagentStart"):
+            return True
+    return False
+
+
 def remove_hook_group(codex_home, state, dry_run):
-    """Remove the owned SubagentStart group; returns absent/noop/delete/update."""
+    """Remove the owned SubagentStart group; returns absent/noop/delete/update.
+
+    The whole file is unlinked only when it is provably an installer-created
+    shell: the current bytes match the recorded state hash AND removing the
+    owned group leaves no unrelated content. A pre-existing hooks.json that was
+    merged at install time therefore keeps its unrelated bytes: the owned group
+    is surgically removed instead.
+    """
     target = codex_home / "hooks.json"
     if not target.exists():
         return "absent"
@@ -731,19 +793,29 @@ def remove_hook_group(codex_home, state, dry_run):
     if len(new_groups) == len(groups):
         status("OK", "hooks.json has no owned v4_flash_worker group")
         return "noop"
+    remaining = dict(document)
+    if new_groups:
+        remaining.setdefault("hooks", {})["SubagentStart"] = new_groups
+    else:
+        hooks = remaining.get("hooks")
+        if isinstance(hooks, dict):
+            hooks.pop("SubagentStart", None)
+            if not hooks:
+                remaining.pop("hooks", None)
     owned_file = sha256_of(target) == state.get("files", {}).get("hooks.json")
+    delete_eligible = owned_file and not _hooks_document_has_unrelated_content(
+        remaining
+    )
     if dry_run:
-        if owned_file:
+        if delete_eligible:
             status("DRY", "hooks.json would be deleted (installer-created)")
         else:
             status("DRY", "hooks.json owned group would be removed")
-        return "delete" if owned_file else "update"
-    if owned_file:
+        return "delete" if delete_eligible else "update"
+    if delete_eligible:
         target.unlink()
         status("REMOVED", "hooks.json")
         return "delete"
-    remaining = dict(document)
-    remaining.setdefault("hooks", {})["SubagentStart"] = new_groups
     write_text_utf8(
         target, json.dumps(remaining, ensure_ascii=False, indent=2) + "\n"
     )
@@ -796,13 +868,14 @@ def remove_config_owned(codex_home, state, dry_run):
         new_lines += lines[end_index:]
         new_text = "\n".join(new_lines).rstrip() + "\n" if new_lines else ""
     owned_file = sha256_of(target) == state.get("files", {}).get("config.toml")
+    delete_eligible = owned_file and not new_text.strip()
     if dry_run:
-        if owned_file and not new_text.strip():
+        if delete_eligible:
             status("DRY", "config.toml would be deleted (installer-created)")
         else:
             status("DRY", "config.toml owned keys would be removed")
-        return "delete" if owned_file and not new_text.strip() else "update"
-    if not new_text.strip():
+        return "delete" if delete_eligible else "update"
+    if delete_eligible:
         target.unlink()
         status("REMOVED", "config.toml")
         return "delete"
@@ -844,13 +917,14 @@ def remove_agents_block(codex_home, state, dry_run):
     remainder = before + after
     new_text = remainder.rstrip() + "\n" if remainder.strip() else ""
     owned_file = sha256_of(target) == state.get("files", {}).get("AGENTS.md")
+    delete_eligible = owned_file and not new_text.strip()
     if dry_run:
-        if owned_file and not new_text.strip():
+        if delete_eligible:
             status("DRY", "AGENTS.md would be deleted (installer-created)")
         else:
             status("DRY", "AGENTS.md owned block would be removed")
-        return "delete" if owned_file and not new_text.strip() else "update"
-    if not new_text.strip():
+        return "delete" if delete_eligible else "update"
+    if delete_eligible:
         target.unlink()
         status("REMOVED", "AGENTS.md")
         return "delete"
@@ -881,6 +955,7 @@ def prune_owned_dirs(codex_home, dry_run):
 
 
 def validate(codex_home):
+    """Validate installed TOML/JSON; returns True only when everything parses."""
     checks = (
         (AGENT_FILENAME, tomllib.loads),
         ("config.toml", tomllib.loads),
@@ -899,10 +974,17 @@ def validate(codex_home):
             all_ok = False
     if all_ok:
         status("OK", "validation: TOML (agent, config) and JSON (hooks) all parse")
+    return all_ok
 
 def _plan_changes(codex_home, mode, python_executable, dry_run):
-    """Compute planned writes (no writes); returns a dict with status lines."""
+    """Compute planned writes (no writes); returns a dict with status lines.
+
+    For ``mode == "add"`` the plan is strict and atomic: any managed artifact
+    that already exists but would be changed by the add is a conflict. A
+    conflicting add must write nothing and record no ownership.
+    """
     writes = []
+    conflicts = []
     hook_definition_changed = False
     agents_block_updated = False
 
@@ -920,9 +1002,10 @@ def _plan_changes(codex_home, mode, python_executable, dry_run):
             return
         if mode == "add":
             status(
-                "WARN",
+                "CONFLICT",
                 f"{rel} already present with different content; use --update to refresh",
             )
+            conflicts.append(rel)
             return
         if dry_run:
             status("DRY", f"{rel} would be written")
@@ -947,12 +1030,25 @@ def _plan_changes(codex_home, mode, python_executable, dry_run):
     if existing_doc is not None and not isinstance(existing_doc, dict):
         raise ValueError("hooks.json must contain a top-level JSON object")
     new_doc, hook_changed, previous = merge_hooks(existing_doc, replacement)
-    if mode == "add" and previous is not None:
-        if hook_changed:
+    if mode == "add":
+        if existing_doc is not None and hook_changed:
             status(
-                "WARN",
-                "hooks.json v4_flash_worker group differs; use --update to refresh",
+                "CONFLICT",
+                "hooks.json exists and would change; use --update to refresh",
             )
+            conflicts.append("hooks.json")
+        elif hook_changed:
+            if dry_run:
+                status("DRY", "hooks.json would be written")
+            writes.append(
+                (
+                    "hooks.json",
+                    (
+                        json.dumps(new_doc, ensure_ascii=False, indent=2) + "\n"
+                    ).encode("utf-8"),
+                )
+            )
+            hook_definition_changed = True
         else:
             status("OK", "hooks.json v4_flash_worker group unchanged")
     elif hook_changed:
@@ -974,12 +1070,17 @@ def _plan_changes(codex_home, mode, python_executable, dry_run):
     config_target = codex_home / "config.toml"
     config_text = read_text_utf8(config_target) if config_target.exists() else ""
     config_new, config_changed = merge_config(config_text)
-    if mode == "add" and CONFIG_SECTION in config_text:
-        if config_changed:
+    if mode == "add":
+        if config_target.exists() and config_changed:
             status(
-                "WARN",
-                "config.toml [shell_environment_policy.set] differs; use --update to refresh",
+                "CONFLICT",
+                "config.toml exists and would change; use --update to refresh",
             )
+            conflicts.append("config.toml")
+        elif config_changed:
+            if dry_run:
+                status("DRY", "config.toml would set [shell_environment_policy.set]")
+            writes.append(("config.toml", config_new.encode("utf-8")))
         else:
             status("OK", "config.toml [shell_environment_policy.set] unchanged")
     elif config_changed:
@@ -994,9 +1095,18 @@ def _plan_changes(codex_home, mode, python_executable, dry_run):
     agents_target = codex_home / "AGENTS.md"
     agents_text = read_text_utf8(agents_target) if agents_target.exists() else ""
     agents_new, agents_changed = merge_agents(agents_text, block)
-    if mode == "add" and f"<!-- {AGENTS_BLOCK_MARKER}:start -->" in agents_text:
-        if agents_changed:
-            status("WARN", "AGENTS.md block differs; use --update to refresh")
+    if mode == "add":
+        if agents_target.exists() and agents_changed:
+            status(
+                "CONFLICT",
+                "AGENTS.md exists and would change; use --update to refresh",
+            )
+            conflicts.append("AGENTS.md")
+        elif agents_changed:
+            if dry_run:
+                status("DRY", "AGENTS.md would be written")
+            writes.append(("AGENTS.md", agents_new.encode("utf-8")))
+            agents_block_updated = True
         else:
             status("OK", "AGENTS.md unchanged")
     elif agents_changed:
@@ -1009,6 +1119,7 @@ def _plan_changes(codex_home, mode, python_executable, dry_run):
 
     return {
         "writes": writes,
+        "conflicts": conflicts,
         "hook_definition_changed": hook_definition_changed,
         "agents_block_updated": agents_block_updated,
         "source": source,
@@ -1086,6 +1197,31 @@ def _run_install(args, action):
 
     writes = plan["writes"]
     source = plan["source"]
+
+    if action == "add" and plan["conflicts"]:
+        for rel in sorted(plan["conflicts"]):
+            status("FAIL", f"{rel}: add conflict; nothing was written or owned")
+        status(
+            "FAIL",
+            "--add is atomic and strict; resolve the conflicts or use --update",
+        )
+        result = {
+            "action": action,
+            "codex_home": str(codex_home),
+            "payload_version": PAYLOAD_VERSION,
+            "changed": 0,
+            "files_changed": [],
+            "conflicts": sorted(plan["conflicts"]),
+            "hook_definition_changed": False,
+            "hook_review_required": False,
+            "agents_block_updated": False,
+            "credential_source": source,
+            "backup_id": None,
+            "exit_code": 2,
+        }
+        _emit_json(args, result)
+        return 2
+
     status("INFO", f"credential source: {source}")
     if "env var" in source:
         status(
@@ -1105,6 +1241,7 @@ def _run_install(args, action):
             status("SKIP", "backup skipped (--skip-backup)")
         try:
             _execute_writes(codex_home, writes)
+            _save_installed_state(codex_home, python_executable, source)
         except Exception as error:  # noqa: BLE001 - rollback is the recovery path
             status("FAIL", f"write failed ({error})")
             if backup_id is not None:
@@ -1124,13 +1261,53 @@ def _run_install(args, action):
             }
             _emit_json(args, result)
             return 1
-        _save_installed_state(codex_home, python_executable, source)
+        section("Validation")
+        if not validate(codex_home):
+            status(
+                "FAIL",
+                "validation failed; rolling back the transaction (exit 1)",
+            )
+            if backup_id is not None:
+                _rollback(codex_home, backup_root / backup_id)
+            result = {
+                "action": action,
+                "codex_home": str(codex_home),
+                "payload_version": PAYLOAD_VERSION,
+                "changed": 0,
+                "files_changed": [],
+                "hook_definition_changed": plan["hook_definition_changed"],
+                "hook_review_required": plan["hook_definition_changed"],
+                "agents_block_updated": plan["agents_block_updated"],
+                "credential_source": source,
+                "backup_id": backup_id,
+                "validation_failed": True,
+                "exit_code": 1,
+            }
+            _emit_json(args, result)
+            return 1
     elif writes:
         status("DRY", f"{len(writes)} file(s) would change; nothing was written")
-
-    if not args.dry_run:
+    elif not args.dry_run:
+        # Nothing needed writing; still surface pre-existing validation problems
+        # instead of reporting a success on a broken install.
         section("Validation")
-        validate(codex_home)
+        if not validate(codex_home):
+            result = {
+                "action": action,
+                "codex_home": str(codex_home),
+                "payload_version": PAYLOAD_VERSION,
+                "changed": 0,
+                "files_changed": [],
+                "hook_definition_changed": plan["hook_definition_changed"],
+                "hook_review_required": plan["hook_definition_changed"],
+                "agents_block_updated": plan["agents_block_updated"],
+                "credential_source": source,
+                "backup_id": None,
+                "validation_failed": True,
+                "exit_code": 1,
+            }
+            _emit_json(args, result)
+            return 1
 
     changed = len(writes)
     hook_review_required = plan["hook_definition_changed"]
@@ -1264,7 +1441,20 @@ def cmd_status(args):
                     break
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             pass
-    hook_definition_changed = current_group != desired
+    # Compare the live Hook to the definition recorded at install time. The
+    # recorded hash is interpreter-independent, so running status with a
+    # different Python than the one used for the install cannot create a false
+    # trust alert. Without a recorded hash (older state or nothing installed)
+    # fall back to comparing against the payload-desired group.
+    recorded_sha = state.get("hook_definition_sha256")
+    if recorded_sha and current_group is not None:
+        hook_definition_changed = (
+            hook_definition_sha256(current_group) != recorded_sha
+        )
+    elif recorded_sha:
+        hook_definition_changed = True
+    else:
+        hook_definition_changed = current_group != desired
 
     result = {
         "action": "status",
@@ -1380,11 +1570,15 @@ def cmd_restore(args):
         _emit_json(args, result)
         return 2
 
+    safety_backup_id = None
     if not args.skip_backup:
-        create_backup(codex_home, backup_root, action="restore")
+        safety = create_backup(codex_home, backup_root, action="restore")
+        safety_backup_id = safety.name
+        status("BACKUP", f"pre-restore safety snapshot saved to {safety}")
     result = restore_backup(chosen, codex_home, yes=args.yes, force=args.force)
     result["action"] = "restore"
     result["backup_id"] = chosen.name
+    result["safety_backup_id"] = safety_backup_id
     result["exit_code"] = 0
     _emit_json(args, result)
     return 0
@@ -1595,10 +1789,19 @@ def main():
         if active
     ]
     if len(actions) > 1:
-        print(
-            f"error: conflicting actions: {', '.join(actions)}; choose exactly one",
-            file=sys.stderr,
+        message = (
+            f"conflicting actions: {', '.join(actions)}; choose exactly one"
         )
+        if args.json:
+            print(
+                json.dumps(
+                    {"error": message, "exit_code": 2},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"error: {message}", file=sys.stderr)
         return 2
 
     if args.add:
