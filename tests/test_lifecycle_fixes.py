@@ -662,3 +662,123 @@ def test_status_malformed_hooks_json_human_fail_line(tmp_path, monkeypatch, caps
     assert mod.cmd_status(make_args(backup_dir=str(backup_root))) == 0
     out = capsys.readouterr().out
     assert "malformed" in out.lower()
+
+
+
+# ---------------------------------------------------------------------------
+# Standalone --backup failures are clean exit-1 JSON/human errors
+# ---------------------------------------------------------------------------
+
+
+def test_backup_json_failure_emits_clean_json_no_partial_dir(
+    tmp_path, monkeypatch, capsys, json_mode
+):
+    """A standalone --backup --json failure is one clean JSON doc, exit 1."""
+    home = make_home(tmp_path)
+    backup_root = tmp_path / "backups"
+
+    def boom_backup(codex_home, backup_root, action="backup"):
+        raise PermissionError("backup dir denied")
+
+    monkeypatch.setattr(mod, "create_backup", boom_backup)
+    assert mod.cmd_backup(make_args(backup_dir=str(backup_root), json=True)) == 1
+    captured = capsys.readouterr()
+    document = _assert_single_json_document(captured.out)
+    assert document["exit_code"] == 1
+    assert document["action"] == "backup"
+    assert document["backup_id"] is None
+    assert "backup" in document["error"].lower()
+    assert not backup_root.exists() or not any(backup_root.iterdir())
+
+
+def test_backup_human_failure_exits_1_no_traceback(tmp_path, monkeypatch, capsys):
+    """A standalone --backup failure in human mode is a clean exit-1 error."""
+    home = make_home(tmp_path)
+    backup_root = tmp_path / "backups"
+
+    def boom_backup(codex_home, backup_root, action="backup"):
+        raise PermissionError("backup dir denied")
+
+    monkeypatch.setattr(mod, "create_backup", boom_backup)
+    assert mod.cmd_backup(make_args(backup_dir=str(backup_root))) == 1
+    out = capsys.readouterr().out
+    assert "backup failed" in out.lower()
+    assert not backup_root.exists() or not any(backup_root.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# --status --json always includes exit_code
+# ---------------------------------------------------------------------------
+
+
+def test_status_json_includes_exit_code(tmp_path, monkeypatch, capsys, json_mode):
+    """Every --status --json document carries exit_code for a uniform schema."""
+    home = setup_install(monkeypatch, tmp_path)
+    backup_root = tmp_path / "backups"
+    assert mod.cmd_status(make_args(backup_dir=str(backup_root), json=True)) == 0
+    document = _assert_single_json_document(capsys.readouterr().out)
+    assert document["exit_code"] == 0
+    assert mod.cmd_install(make_args(backup_dir=str(backup_root))) == 0
+    assert mod.cmd_status(make_args(backup_dir=str(backup_root), json=True)) == 0
+    document = _assert_single_json_document(capsys.readouterr().out)
+    assert document["exit_code"] == 0
+
+
+# ---------------------------------------------------------------------------
+# hooks: null is rejected as a non-object by install/status/remove
+# ---------------------------------------------------------------------------
+
+
+def test_install_rejects_hooks_null_clean_json(tmp_path, monkeypatch, capsys, json_mode):
+    """Install with hooks: null fails planning cleanly with zero writes."""
+    home = setup_install(monkeypatch, tmp_path)
+    _seed_hooks(home, {"description": "user hooks", "hooks": None})
+    backup_root = tmp_path / "backups"
+    assert mod.cmd_install(make_args(backup_dir=str(backup_root), json=True)) == 1
+    captured = capsys.readouterr()
+    document = _assert_single_json_document(captured.out)
+    assert document["exit_code"] == 1
+    assert document["changed"] == 0
+    assert "planning failed" in captured.err.lower()
+    assert "hooks" in captured.err.lower()
+    assert not (home / "agents/v4-flash-worker.toml").exists()
+    assert not mod.state_dir(home).exists()
+    assert len(mod.list_backups(backup_root)) == 0
+
+
+def test_status_reports_hooks_null_as_hooks_error(tmp_path, monkeypatch, capsys, json_mode):
+    """--status --json reports hooks: null as a structural hooks error."""
+    home = setup_install(monkeypatch, tmp_path)
+    _seed_hooks(home, {"description": "user hooks", "hooks": None})
+    backup_root = tmp_path / "backups"
+    assert mod.cmd_status(make_args(backup_dir=str(backup_root), json=True)) == 0
+    document = _assert_single_json_document(capsys.readouterr().out)
+    assert document["hooks_error"]
+    assert "hooks" in document["hooks_error"].lower()
+
+
+def test_remove_rejects_hooks_null_no_writes(tmp_path, monkeypatch, capsys, json_mode):
+    """--remove with hooks: null aborts cleanly with zero writes and no backup."""
+    home = setup_install(monkeypatch, tmp_path)
+    backup_root = tmp_path / "backups"
+    assert mod.cmd_install(make_args(backup_dir=str(backup_root))) == 0
+    hooks_target = home / "hooks.json"
+    hooks_target.write_text(
+        json.dumps({"description": "user hooks", "hooks": None}), encoding="utf-8"
+    )
+    before_agent = (home / "agents/v4-flash-worker.toml").read_bytes()
+    malformed_hooks = hooks_target.read_bytes()
+    backups_before = len(mod.list_backups(backup_root))
+    assert (
+        mod.cmd_remove(make_args(backup_dir=str(backup_root), yes=True, json=True))
+        == 1
+    )
+    captured = capsys.readouterr()
+    document = _assert_single_json_document(captured.out)
+    assert document["exit_code"] == 1
+    assert document["removed_files"] == []
+    assert document["backup_id"] is None
+    assert (home / "agents/v4-flash-worker.toml").read_bytes() == before_agent
+    assert hooks_target.read_bytes() == malformed_hooks
+    assert mod.state_dir(home).exists()
+    assert len(mod.list_backups(backup_root)) == backups_before

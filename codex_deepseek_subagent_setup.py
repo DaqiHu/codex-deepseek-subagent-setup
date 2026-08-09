@@ -483,7 +483,7 @@ def _validate_hooks_shape(document):
     if not isinstance(document, dict):
         raise ValueError("hooks.json must contain a top-level JSON object")
     hooks = document.get("hooks")
-    if hooks is not None and not isinstance(hooks, dict):
+    if "hooks" in document and not isinstance(hooks, dict):
         raise ValueError("hooks.json 'hooks' must be a JSON object")
     groups = hooks.get("SubagentStart", []) if hooks is not None else []
     if not isinstance(groups, list):
@@ -1450,7 +1450,19 @@ def cmd_backup(args):
         }
         _emit_json(args, result)
         return 0
-    backup_dir = create_backup(codex_home, backup_root, action="backup")
+    try:
+        backup_dir = create_backup(codex_home, backup_root, action="backup")
+    except Exception as error:  # noqa: BLE001 - report as a clean failure
+        status("FAIL", f"backup failed ({error}); no snapshot was created")
+        result = {
+            "action": "backup",
+            "backup_id": None,
+            "backup_dir": str(backup_root),
+            "error": f"backup failed: {error}",
+            "exit_code": 1,
+        }
+        _emit_json(args, result)
+        return 1
     status("BACKUP", f"snapshot saved to {backup_dir}")
     result = {
         "action": "backup",
@@ -1557,6 +1569,7 @@ def cmd_status(args):
         "hook_review_required": hook_definition_changed,
         "files": files_report,
         "backups": backups,
+        "exit_code": 0,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

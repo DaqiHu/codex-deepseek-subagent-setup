@@ -133,7 +133,8 @@ Clean-failure rules:
 
 - A pre-change backup failure aborts the action with `exit_code: 1`, an
   `error` message, and zero writes. This applies to install/update/add, the
-  `--remove` pre-remove snapshot, and the `--restore` safety snapshot.
+  `--remove` pre-remove snapshot, the `--restore` safety snapshot, and a
+  standalone `--backup`.
 - A failed backup removes its partially-written snapshot directory before
   reporting, so a failed backup never leaves a half-written snapshot behind.
 - A structurally invalid `hooks.json` (non-object top level, non-object
