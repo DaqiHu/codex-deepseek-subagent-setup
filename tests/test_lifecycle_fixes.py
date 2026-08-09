@@ -739,6 +739,8 @@ def test_install_rejects_hooks_null_clean_json(tmp_path, monkeypatch, capsys, js
     document = _assert_single_json_document(captured.out)
     assert document["exit_code"] == 1
     assert document["changed"] == 0
+    assert "planning failed" in document["error"].lower()
+    assert "hooks" in document["error"].lower()
     assert "planning failed" in captured.err.lower()
     assert "hooks" in captured.err.lower()
     assert not (home / "agents/v4-flash-worker.toml").exists()

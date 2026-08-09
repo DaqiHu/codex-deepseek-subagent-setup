@@ -1239,6 +1239,7 @@ def _run_install(args, action):
             "agents_block_updated": False,
             "credential_source": None,
             "backup_id": None,
+            "error": f"planning failed: {error}",
             "exit_code": 1,
         }
         _emit_json(args, result)
