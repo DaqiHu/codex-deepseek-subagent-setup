@@ -33,16 +33,24 @@ description: Use when Codex considers spawning, continuing, or troubleshooting t
 
 ## Verify the installation
 
-The version-controlled source lives at `codex/skills/use-v4-flash-worker` in
-the agents repository and is intentionally not discovered from `~/.agents`, so
-shared cross-agent environments never see it. Run the installer after copying
-or updating this skill. It selects the current Python executable for the
-Windows Hook, installs an explicit `commandWindows`, sets `PYTHONUTF8=1` and
-`PYTHONIOENCODING=utf-8` in Codex's shell environment, publishes the single
-runtime skill to `~/.codex/skills/use-v4-flash-worker`, copies the Hook to
+The `use-v4-flash-worker` runtime skill exists only under `CODEX_HOME/skills`
+(typically `~/.codex/skills/use-v4-flash-worker`) and is intentionally
+not discovered from `~/.agents`, so shared cross-agent environments never
+see it.
+The version-controlled source ships the same payload through two deliveries:
+the agents repository at `codex/skills/use-v4-flash-worker` (never loaded from
+`~/.agents`) and the standalone `codex-deepseek-subagent-setup` package, which
+embeds the identical skill for new machines. Update the installed copy through
+the owning installer/source package: run the agents repository's
+`scripts/install.py`, or re-run the standalone setup installer when the machine
+was provisioned by it. The agents repository installer selects the current
+Python executable for the Windows Hook, installs an explicit `commandWindows`,
+sets `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` in Codex's shell environment,
+publishes the single runtime skill to `~/.codex/skills/use-v4-flash-worker`,
+copies the Hook to
 `~/.codex/hooks/codex-deepseek-subagent/plaintext_handoff.py`, and idempotently
 synchronizes the marked Codex AGENTS block into `~/.codex/AGENTS.md` while
-preserving unrelated content:
+preserving unrelated content. From the agents repository source, run:
 
 ```powershell
 uv run python "<skill-dir>\scripts\install.py"
