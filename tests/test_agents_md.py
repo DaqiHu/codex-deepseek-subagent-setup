@@ -1,57 +1,66 @@
-"""AGENTS.md marker blocks: create, replace, preserve unrelated lines."""
+"""AGENTS.md block sync, legacy migration, and surgical removal."""
 
 import codex_deepseek_subagent_setup as mod
 
 
-def test_creates_file(tmp_path):
-    assert mod.ensure_agents_md(tmp_path, dry_run=False)
-    text = (tmp_path / "AGENTS.md").read_text()
-    assert "<!-- codex-deepseek-subagent:start -->" in text
-    assert "<!-- codex-deepseek-subagent:end -->" in text
-    assert "<!-- task-handoff:start -->" in text
-    assert "<!-- task-handoff:end -->" in text
+def block():
+    return mod.agents_block_text()
 
 
-def test_replaces_blocks_preserves_unrelated(tmp_path):
-    target = tmp_path / "AGENTS.md"
-    target.write_text(
-        "# My notes\n"
+def test_merge_creates_block():
+    text, changed = mod.merge_agents("", block())
+    assert changed
+    assert f"<!-- {mod.AGENTS_BLOCK_MARKER}:start -->" in text
+    assert text.count(f"<!-- {mod.AGENTS_BLOCK_MARKER}:start -->") == 1
+
+
+def test_merge_migrates_legacy_marker():
+    legacy = (
         "<!-- codex-deepseek-subagent:start -->\n"
-        "- stale routing\n"
+        "legacy routing\n"
         "<!-- codex-deepseek-subagent:end -->\n"
-        "<!-- task-handoff:start -->\n"
-        "- stale task block\n"
-        "<!-- task-handoff:end -->\n"
-        "keep me\n"
     )
-    assert mod.ensure_agents_md(tmp_path, dry_run=False)
+    unrelated = "# user\nkeep\n"
+    text, changed = mod.merge_agents(legacy + "\n" + unrelated, block())
+    assert changed
+    assert "<!-- codex-deepseek-subagent:start -->" not in text
+    assert text.count(f"<!-- {mod.AGENTS_BLOCK_MARKER}:start -->") == 1
+    assert "keep" in text
+
+
+def test_merge_preserves_unrelated_content():
+    existing = "# my rules\n\n- keep\n"
+    text, changed = mod.merge_agents(existing, block())
+    assert changed
+    assert text.startswith("# my rules")
+    assert "- keep" in text
+
+
+def test_merge_idempotent():
+    text, _ = mod.merge_agents("", block())
+    again, changed = mod.merge_agents(text, block())
+    assert not changed
+    assert again == text
+
+
+def test_remove_block_preserves_unrelated(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    target = home / "AGENTS.md"
+    merged, _ = mod.merge_agents("", block())
+    target.write_text(merged + "# user section\nkeep-me\n", encoding="utf-8")
+    assert mod.remove_agents_block(home, {}, dry_run=False) == "update"
     text = target.read_text()
-    assert "keep me" in text
-    assert "# My notes" in text
-    assert "stale routing" not in text
-    assert "stale task block" not in text
-    assert "prefer `v4_flash_worker`" in text
+    assert "codex-v4-flash-worker-agents" not in text
+    assert "keep-me" in text
 
 
-def test_partial_block_rebuilds_whole_doc(tmp_path):
-    target = tmp_path / "AGENTS.md"
-    target.write_text(
-        "<!-- codex-deepseek-subagent:start -->\n- stale\n<!-- codex-deepseek-subagent:end -->\n"
-    )
-    mod.ensure_agents_md(tmp_path, dry_run=False)
-    text = target.read_text()
-    assert "<!-- task-handoff:start -->" in text
-
-
-def test_appends_when_no_blocks(tmp_path):
-    target = tmp_path / "AGENTS.md"
-    target.write_text("existing content\n")
-    mod.ensure_agents_md(tmp_path, dry_run=False)
-    text = target.read_text()
-    assert text.startswith("existing content")
-    assert "<!-- codex-deepseek-subagent:start -->" in text
-
-
-def test_idempotent(tmp_path):
-    mod.ensure_agents_md(tmp_path, dry_run=False)
-    assert not mod.ensure_agents_md(tmp_path, dry_run=False)
+def test_remove_block_deletes_owned_file(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    target = home / "AGENTS.md"
+    merged, _ = mod.merge_agents("", block())
+    target.write_text(merged, encoding="utf-8")
+    state = {"files": {"AGENTS.md": mod.sha256_of(target)}}
+    assert mod.remove_agents_block(home, state, dry_run=False) == "delete"
+    assert not target.exists()
