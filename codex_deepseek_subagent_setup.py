@@ -372,6 +372,16 @@ def _existing_agent_credentials(codex_home):
     return None
 
 
+def _prompt_line(prompt, stream):
+    """Print ``prompt`` to ``stream`` and read one line from stdin.
+
+    ``input(prompt)`` always writes the prompt to stdout; printing it
+    explicitly keeps stdout free for the single JSON document in --json mode.
+    """
+    print(prompt, end="", file=stream, flush=True)
+    return input()
+
+
 def resolve_credentials(codex_home):
     """Resolve (base_url, provider_lines, source_label).
 
@@ -384,12 +394,28 @@ def resolve_credentials(codex_home):
     user_base = None
     user_key = None
     if sys.stdin.isatty():
+        # input(prompt) writes the prompt to stdout, which would pollute the
+        # single JSON document in --json mode; print the prompt explicitly so
+        # it can be routed to stderr while still reading from the real TTY.
+        prompt_stream = sys.stderr if _OUTPUT_JSON else sys.stdout
         try:
-            print("Credential input (press Enter to auto-resolve):")
-            hint = existing[0] if existing and existing[0] else "https://api.deepseek.com"
-            user_base = input(f"  base URL [{hint}]: ").strip() or None
-            print("  API key (visible while typing; Enter to auto-resolve): ", end="", flush=True)
-            user_key = input().strip() or None
+            print(
+                "Credential input (press Enter to auto-resolve):",
+                file=prompt_stream,
+            )
+            hint = (
+                existing[0]
+                if existing and existing[0]
+                else "https://api.deepseek.com"
+            )
+            user_base = (
+                _prompt_line(f"  base URL [{hint}]: ", prompt_stream).strip()
+                or None
+            )
+            user_key = _prompt_line(
+                "  API key (visible while typing; Enter to auto-resolve): ",
+                prompt_stream,
+            ).strip() or None
         except EOFError:
             # Closed/absent stdin (piped, CI, spawned): fall back to automatic
             # resolution instead of aborting the whole install.
@@ -447,6 +473,23 @@ def hook_definition_sha256(group):
     )
 
 
+def _validate_hooks_shape(document):
+    """Validate a parsed hooks.json container; raise ValueError when malformed.
+
+    Uses the same "must be a JSON array" convention as merge_hooks so install,
+    remove, and status all refuse structurally invalid hooks documents with a
+    clean controlled error instead of an AttributeError traceback.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("hooks.json must contain a top-level JSON object")
+    hooks = document.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        raise ValueError("hooks.json 'hooks' must be a JSON object")
+    groups = hooks.get("SubagentStart", []) if hooks is not None else []
+    if not isinstance(groups, list):
+        raise ValueError("hooks.json SubagentStart must be a JSON array")
+
+
 def merge_hooks(existing, replacement):
     """Merge the owned SubagentStart group; return (document, changed, previous).
 
@@ -461,9 +504,8 @@ def merge_hooks(existing, replacement):
         }
         return document, True, None
     document = existing
+    _validate_hooks_shape(document)
     groups = document.setdefault("hooks", {}).setdefault("SubagentStart", [])
-    if not isinstance(groups, list):
-        raise ValueError("hooks.SubagentStart must be a JSON array")
     previous = None
     for index, group in enumerate(groups):
         if isinstance(group, dict) and group.get("matcher") == replacement["matcher"]:
@@ -602,42 +644,50 @@ def backup_root_from_args(args):
     return default_backup_root()
 
 def create_backup(codex_home, backup_root, action="install"):
-    """Absence-aware snapshot of every managed file plus installer state."""
+    """Absence-aware snapshot of every managed file plus installer state.
+
+    A failure mid-snapshot removes the partial backup directory before
+    re-raising, so a failed backup never leaves a half-written snapshot.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     backup_dir = backup_root / stamp
-    files_dir = backup_dir / "files"
-    manifest = {
-        "format_version": 2,
-        "tool": TOOL_NAME,
-        "payload_version": PAYLOAD_VERSION,
-        "created_at": stamp,
-        "platform": os.name,
-        "codex_home": str(codex_home),
-        "action": action,
-        "files": {},
-        "state": {},
-    }
-    for rel in MANAGED_FILES:
-        source = codex_home / rel
-        if not source.exists():
-            manifest["files"][rel] = {"absent": True}
-            continue
-        destination = files_dir / rel
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        manifest["files"][rel] = {"sha256": sha256_of(source)}
-    state_file = state_path(codex_home)
-    if state_file.exists():
-        destination = files_dir / STATE_DIR_NAME / "state.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(state_file, destination)
-        manifest["state"] = {"sha256": sha256_of(state_file)}
-    else:
-        manifest["state"] = {"absent": True}
-    write_text_utf8(
-        backup_dir / "manifest.json",
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-    )
+    try:
+        files_dir = backup_dir / "files"
+        manifest = {
+            "format_version": 2,
+            "tool": TOOL_NAME,
+            "payload_version": PAYLOAD_VERSION,
+            "created_at": stamp,
+            "platform": os.name,
+            "codex_home": str(codex_home),
+            "action": action,
+            "files": {},
+            "state": {},
+        }
+        for rel in MANAGED_FILES:
+            source = codex_home / rel
+            if not source.exists():
+                manifest["files"][rel] = {"absent": True}
+                continue
+            destination = files_dir / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            manifest["files"][rel] = {"sha256": sha256_of(source)}
+        state_file = state_path(codex_home)
+        if state_file.exists():
+            destination = files_dir / STATE_DIR_NAME / "state.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(state_file, destination)
+            manifest["state"] = {"sha256": sha256_of(state_file)}
+        else:
+            manifest["state"] = {"absent": True}
+        write_text_utf8(
+            backup_dir / "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+    except Exception:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise
     return backup_dir
 
 
@@ -782,9 +832,8 @@ def remove_hook_group(codex_home, state, dry_run):
     if not target.exists():
         return "absent"
     document = json.loads(read_text_utf8(target))
+    _validate_hooks_shape(document)
     groups = document.get("hooks", {}).get("SubagentStart", [])
-    if not isinstance(groups, list):
-        raise ValueError("hooks.json SubagentStart must be a JSON array")
     new_groups = [
         group
         for group in groups
@@ -1234,7 +1283,29 @@ def _run_install(args, action):
     if writes and not args.dry_run:
         backup_root = backup_root_from_args(args)
         if not args.skip_backup:
-            backup_dir = create_backup(codex_home, backup_root, action=action)
+            try:
+                backup_dir = create_backup(codex_home, backup_root, action=action)
+            except Exception as error:  # noqa: BLE001 - report as a clean failure
+                status(
+                    "FAIL",
+                    f"backup failed ({error}); nothing was written",
+                )
+                result = {
+                    "action": action,
+                    "codex_home": str(codex_home),
+                    "payload_version": PAYLOAD_VERSION,
+                    "changed": 0,
+                    "files_changed": [],
+                    "hook_definition_changed": plan["hook_definition_changed"],
+                    "hook_review_required": plan["hook_definition_changed"],
+                    "agents_block_updated": plan["agents_block_updated"],
+                    "credential_source": source,
+                    "backup_id": None,
+                    "error": f"backup failed: {error}",
+                    "exit_code": 1,
+                }
+                _emit_json(args, result)
+                return 1
             backup_id = backup_dir.name
             status("BACKUP", f"pre-change snapshot saved to {backup_dir}")
         else:
@@ -1309,10 +1380,16 @@ def _run_install(args, action):
             _emit_json(args, result)
             return 1
 
-    changed = len(writes)
+    applied = 0 if args.dry_run else len(writes)
     hook_review_required = plan["hook_definition_changed"]
     section("Summary")
-    status("CHANGED" if changed else "OK", f"{changed} file(s) changed")
+    if args.dry_run and writes:
+        status(
+            "OK",
+            f"dry run: {len(writes)} file(s) planned; nothing was written",
+        )
+    else:
+        status("CHANGED" if applied else "OK", f"{applied} file(s) changed")
     if hook_review_required:
         status(
             "HOOK",
@@ -1328,8 +1405,10 @@ def _run_install(args, action):
         "action": action,
         "codex_home": str(codex_home),
         "payload_version": PAYLOAD_VERSION,
-        "changed": changed,
-        "files_changed": sorted(rel for rel, _ in writes),
+        "changed": applied,
+        "files_changed": (
+            [] if args.dry_run else sorted(rel for rel, _ in writes)
+        ),
         "hook_definition_changed": hook_review_required,
         "hook_review_required": hook_review_required,
         "agents_block_updated": plan["agents_block_updated"],
@@ -1337,6 +1416,10 @@ def _run_install(args, action):
         "backup_id": backup_id,
         "exit_code": 0,
     }
+    if args.dry_run:
+        result["dry_run"] = True
+        result["planned_changes"] = len(writes)
+        result["planned_files"] = sorted(rel for rel, _ in writes)
     _emit_json(args, result)
     return 0
 
@@ -1428,10 +1511,12 @@ def cmd_status(args):
         files_report[rel] = entry
 
     current_group = None
+    hooks_error = None
     hooks_target = codex_home / "hooks.json"
     if hooks_target.exists():
         try:
             document = json.loads(read_text_utf8(hooks_target))
+            _validate_hooks_shape(document)
             for group in document.get("hooks", {}).get("SubagentStart", []):
                 if (
                     isinstance(group, dict)
@@ -1439,8 +1524,13 @@ def cmd_status(args):
                 ):
                     current_group = group
                     break
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            pass
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+            ValueError,
+        ) as error:
+            hooks_error = str(error)
     # Compare the live Hook to the definition recorded at install time. The
     # recorded hash is interpreter-independent, so running status with a
     # different Python than the one used for the install cannot create a false
@@ -1462,6 +1552,7 @@ def cmd_status(args):
         "payload_version": state.get("payload_version", PAYLOAD_VERSION),
         "installed": bool(state),
         "credential_source": state.get("credential_source"),
+        "hooks_error": hooks_error,
         "hook_definition_changed": hook_definition_changed,
         "hook_review_required": hook_definition_changed,
         "files": files_report,
@@ -1483,6 +1574,8 @@ def cmd_status(args):
             else:
                 mark, message = "DRIFTED", f"{rel} (not owned by this installer)"
             status(mark, message)
+        if hooks_error:
+            status("FAIL", f"hooks.json is malformed ({hooks_error})")
         status(
             "HOOK",
             "definition changed; review required"
@@ -1572,7 +1665,26 @@ def cmd_restore(args):
 
     safety_backup_id = None
     if not args.skip_backup:
-        safety = create_backup(codex_home, backup_root, action="restore")
+        try:
+            safety = create_backup(codex_home, backup_root, action="restore")
+        except Exception as error:  # noqa: BLE001 - report as a clean failure
+            status(
+                "FAIL",
+                f"safety backup failed ({error}); restore aborted, "
+                "nothing was changed",
+            )
+            result = {
+                "action": "restore",
+                "backup_id": chosen.name,
+                "restored": [],
+                "deleted": [],
+                "skipped": [],
+                "refused": [],
+                "error": f"safety backup failed: {error}",
+                "exit_code": 1,
+            }
+            _emit_json(args, result)
+            return 1
         safety_backup_id = safety.name
         status("BACKUP", f"pre-restore safety snapshot saved to {safety}")
     result = restore_backup(chosen, codex_home, yes=args.yes, force=args.force)
@@ -1609,11 +1721,59 @@ def cmd_remove(args):
         _emit_json(args, result)
         return 2
 
+    # A malformed hooks.json container must abort the whole removal before
+    # any write so remove never partially mutates on a bad shape.
+    hooks_target = codex_home / "hooks.json"
+    if hooks_target.exists():
+        try:
+            _validate_hooks_shape(json.loads(read_text_utf8(hooks_target)))
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+            ValueError,
+        ) as error:
+            status(
+                "FAIL",
+                f"hooks.json is malformed ({error}); removal aborted, "
+                "nothing was changed",
+            )
+            result = {
+                "action": "remove",
+                "removed_files": [],
+                "kept_files": [],
+                "pruned_dirs": [],
+                "backup_id": None,
+                "state_removed": False,
+                "error": f"hooks.json is malformed: {error}",
+                "exit_code": 1,
+            }
+            _emit_json(args, result)
+            return 1
+
     backup_id = None
     if not args.dry_run and not args.skip_backup:
-        backup_dir = create_backup(
-            codex_home, backup_root_from_args(args), action="remove"
-        )
+        try:
+            backup_dir = create_backup(
+                codex_home, backup_root_from_args(args), action="remove"
+            )
+        except Exception as error:  # noqa: BLE001 - report as a clean failure
+            status(
+                "FAIL",
+                f"backup failed ({error}); nothing was removed",
+            )
+            result = {
+                "action": "remove",
+                "removed_files": [],
+                "kept_files": [],
+                "pruned_dirs": [],
+                "backup_id": None,
+                "state_removed": False,
+                "error": f"backup failed: {error}",
+                "exit_code": 1,
+            }
+            _emit_json(args, result)
+            return 1
         backup_id = backup_dir.name
         status("BACKUP", f"pre-remove snapshot saved to {backup_dir}")
 
@@ -1663,6 +1823,8 @@ def cmd_remove(args):
         "state_removed": state_removed,
         "exit_code": 0,
     }
+    if args.dry_run:
+        result["dry_run"] = True
     _emit_json(args, result)
     return 0
 

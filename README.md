@@ -83,7 +83,8 @@ idempotent install/upsert for backward compatibility.
 | `--remove` | remove only installer-owned content |
 
 Shared flags: `--yes` (confirm destructive actions), `--force` (override
-ownership checks), `--json` (JSON result on stdout), `--dry-run` (preview only),
+ownership checks), `--json` (exactly one JSON result on stdout; progress and
+credential prompts go to stderr), `--dry-run` (preview only),
 `--backup-dir PATH`, `--skip-backup`, `--codex-home PATH`,
 `--python-executable PATH`, `--manual`.
 
@@ -106,8 +107,39 @@ python3 codex_deepseek_subagent_setup.py --remove --yes       # real removal
 | Code | Meaning |
 |---|---|
 | `0` | success or no-op |
-| `1` | failure (write/state-save/validation failure with automatic rollback, no backups found) |
+| `1` | failure (write/state-save/validation failure with automatic rollback, pre-change backup failure, malformed `hooks.json`, no backups found) |
 | `2` | usage error or refusal (conflicting actions, `--add` conflict, unknown backup ID, destructive action without `--yes`/`--force`) |
+
+## JSON output contract
+
+With `--json`, stdout carries exactly one JSON document for every action and
+every outcome - success, refusal, or clean failure. Progress, status, and
+credential-prompt lines are routed to stderr (prompts still read from the real
+TTY), so piped and automated callers always get a parseable document even when
+the run is interactive.
+
+Install results distinguish planned from applied work so a `--dry-run` can
+never be mistaken for a real write:
+
+| Field | Real run | `--dry-run` |
+|---|---|---|
+| `dry_run` | absent | `true` |
+| `changed` | files actually written | `0` |
+| `files_changed` | files actually written | `[]` |
+| `planned_changes` | absent | files that would be written |
+| `planned_files` | absent | files that would be written |
+
+Clean-failure rules:
+
+- A pre-change backup failure aborts the action with `exit_code: 1`, an
+  `error` message, and zero writes. This applies to install/update/add, the
+  `--remove` pre-remove snapshot, and the `--restore` safety snapshot.
+- A failed backup removes its partially-written snapshot directory before
+  reporting, so a failed backup never leaves a half-written snapshot behind.
+- A structurally invalid `hooks.json` (non-object top level, non-object
+  `hooks`, or non-array `SubagentStart`) refuses `--remove` with `exit_code: 1`
+  and zero writes, and is reported as `hooks_error` in `--status` instead of a
+  traceback.
 
 ## Backups and state
 
